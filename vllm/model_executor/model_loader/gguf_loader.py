@@ -151,6 +151,18 @@ class GGUFModelLoader(BaseModelLoader):
                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                     )
                 )
+        if model_type in ("qwen3_5_moe_text", "qwen3_5_moe", "qwen3_5"):
+            is_moe = "moe" in model_type
+            model_type = "qwen35moe" if is_moe else "qwen35"
+            # Qwen3.5 HF config auto-instantiates vision_config even for
+            # text-only checkpoints; force the text-only GGUF loading path.
+            is_multimodal = False
+            if is_moe:
+                extra_map, extra_sideloads = GGUFModelLoader._build_qwen35moe_name_map(
+                    text_config.num_hidden_layers
+                )
+                gguf_to_hf_name_map.update(extra_map)
+                sideload_params.extend(extra_sideloads)
         if model_type in ("qwen2_moe", "qwen3_moe"):
             model_type = model_type.replace("_", "")
             # GGUF layer map assumes that we will have a merged expert weights
@@ -338,6 +350,44 @@ class GGUFModelLoader(BaseModelLoader):
                 f"{unmapped_params}"
             )
         return gguf_to_hf_name_map
+
+    @staticmethod
+    def _build_qwen35moe_name_map(
+        num_hidden_layers: int,
+    ) -> tuple[dict[str, str], list[re.Pattern]]:
+        """Return the manual GGUF→HF name overrides for Qwen3.5 MoE.
+
+        Separated so the mapping logic can be unit-tested without instantiating
+        the full GGUFModelLoader (which requires the vllm C extension).
+        """
+        name_map: dict[str, str] = {}
+        sideloads: list[re.Pattern] = []
+        lm_prefix = "model"
+        for idx in range(num_hidden_layers):
+            name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                f"{lm_prefix}.layers.{idx}.mlp.experts.0.down_proj.weight"
+            )
+            name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                f"{lm_prefix}.layers.{idx}.mlp.experts.0.gate_proj.weight"
+            )
+            name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                f"{lm_prefix}.layers.{idx}.mlp.experts.0.up_proj.weight"
+            )
+            sideloads.append(
+                re.compile(
+                    f"model\\.layers\\.{idx}"
+                    r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
+                )
+            )
+            # ssm_dt.bias has no .weight/.bias suffix so gguf-py produces a
+            # trailing-dot key that never matches; override manually.
+            name_map[f"blk.{idx}.ssm_dt.bias"] = (
+                f"{lm_prefix}.layers.{idx}.linear_attn.dt_bias"
+            )
+            # ssm_a is a bare 1-D tensor; gguf-py maps it to
+            # "linear_attn.A_log." (trailing dot) which never matches.
+            name_map[f"blk.{idx}.ssm_a"] = f"{lm_prefix}.layers.{idx}.linear_attn.A_log"
+        return name_map, sideloads
 
     def _get_gguf_weight_type(
         self,
