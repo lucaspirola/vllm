@@ -19,6 +19,81 @@ from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+class _WarmupBlockAllocator:
+    """Hands out warmup block ids that stay in-bounds for each KV cache group's
+    own pool depth.
+
+    Background (the OOB this guards against): warmup runs a real forward pass on
+    dummy data to JIT-compile kernels. It bypasses the runtime BlockPools, so it
+    must pick the dummy block ids itself. The legacy code used a SINGLE monotonic
+    counter shared across ALL groups, so with a per-group-depth config (gemma4:
+    5 shallow sliding pools of depth ``D_sw`` plus 1 deep global pool of depth
+    ``D_global``) the later groups received ids that climbed well past a shallow
+    group's ``D_sw``. The forward pass then indexed that group's depth-``D_sw``
+    KV tensor OUT OF BOUNDS (illegal address / silent corruption).
+
+    Two modes:
+
+    * Legacy (``per_group_depths is None``): a single monotonic counter shared
+      across all groups, starting at 1 (id 0 is the reserved null block). This
+      reproduces the old behavior BYTE-IDENTICALLY -- the ``group`` argument is
+      ignored and ids advance globally in call order.
+    * Per-group (gemma4): each group ``i`` draws from its OWN ``[1, depth_i)``
+      space, cycling within that range. Because warmup data is dummy and only
+      needs to be in-bounds for graph capture, reusing ids within a group across
+      requests is fine -- the only invariant is ``id < depth_i``.
+    """
+
+    def __init__(self, per_group_depths: list[int] | None, num_groups: int) -> None:
+        self._per_group = per_group_depths is not None
+        if self._per_group:
+            assert per_group_depths is not None  # narrow for type checkers
+            self._depths = per_group_depths
+            # Per-group monotonic cursor; start at 1 to reserve id 0 (null).
+            self._cursors = [1] * num_groups
+        else:
+            # Single shared counter -- exact legacy behavior.
+            self._next_block_id = 1
+
+    def alloc(self, group: int, num_blocks: int) -> list[int]:
+        """Return ``num_blocks`` ids for ``group``.
+
+        Legacy mode: ids come from one global monotonic counter (``group``
+        ignored), byte-identical to the previous implementation.
+
+        Per-group mode: ids advance monotonically within ``[1, depth)`` and wrap
+        back to 1 before reaching the group's depth, so every id is strictly
+        in-bounds for that group's KV tensor and never the null block (0).
+        """
+        if not self._per_group:
+            start = self._next_block_id
+            self._next_block_id = start + num_blocks
+            return list(range(start, self._next_block_id))
+
+        depth = self._depths[group]
+        if depth <= 1:
+            # Degenerate pool with no non-null id; the null block (0) is always
+            # in-bounds. A real KV pool is sized for at least one request, so
+            # this only guards pathological configs from emitting an OOB id.
+            return [0] * num_blocks
+        ids = []
+        cur = self._cursors[group]
+        for _ in range(num_blocks):
+            if cur >= depth:
+                # Wrap: dummy warmup data, so id reuse within a group is fine;
+                # we only require every id to be in-bounds for that group's
+                # KV tensor.
+                cur = 1
+            ids.append(cur)
+            cur += 1
+        # Keep the cursor inside [1, depth) so the NEXT alloc for this group also
+        # starts in-bounds (matters when the usable space is a single id).
+        if cur >= depth:
+            cur = 1
+        self._cursors[group] = cur
+        return ids
+
+
 @torch.inference_mode()
 def warmup_kernels(
     model_runner: GPUModelRunner,
@@ -55,6 +130,13 @@ def warmup_kernels(
     ]
     max_blocks_per_req = sum(decode_block_counts)
 
+    # ``num_blocks`` is the GLOBAL budget (``max(per_group_num_blocks)`` ==
+    # ``D_global`` when per-group depths are set), so this bound can over-count
+    # capacity for a SHALLOW per-group pool. That is harmless now: the allocator
+    # confines each group's ids to its OWN depth (cycling within ``[1, depth)``),
+    # so a too-large ``num_reqs`` only means more id REUSE inside a shallow group,
+    # never an out-of-bounds id. For the legacy single-pool path this is exactly
+    # the previous formula, unchanged.
     num_reqs = min(
         model_runner.scheduler_config.max_num_seqs,
         model_runner.scheduler_config.max_num_batched_tokens
@@ -73,18 +155,23 @@ def warmup_kernels(
         sampling_params = SamplingParams.for_sampler_warmup()
         pooling_params = None
 
-    # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+    # Assign block IDs per request per group. Id 0 is the null block; real ids
+    # start at 1. Each group's ids are confined to its OWN pool depth so the
+    # warmup forward pass never indexes a (shallow) per-group KV tensor out of
+    # bounds. The legacy single-pool path keeps a single monotonic counter and
+    # is byte-identical (see ``_WarmupBlockAllocator``).
+    allocator = _WarmupBlockAllocator(
+        model_runner.kv_cache_config.per_group_num_blocks,
+        num_kv_cache_groups,
+    )
 
     # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
     new_reqs = [
         NewRequestData.from_request(
             Request(req_ids[i], prompt_token_ids, sampling_params, pooling_params),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                allocator.alloc(g, n) for g, n in enumerate(prefill_block_counts)
+            ),
             prefill_token_ids=prompt_token_ids,
         )
         for i in range(num_reqs)
@@ -125,7 +212,11 @@ def warmup_kernels(
         cached_req_data.num_output_tokens = [1] * num_reqs
         new_block = any(decode_block_deltas)
         cached_req_data.new_block_ids = [
-            tuple(_alloc_blocks(n) for n in decode_block_deltas) if new_block else None
+            tuple(
+                allocator.alloc(g, n) for g, n in enumerate(decode_block_deltas)
+            )
+            if new_block
+            else None
             for _ in range(num_reqs)
         ]
 

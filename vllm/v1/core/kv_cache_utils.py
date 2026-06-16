@@ -938,9 +938,15 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
-    if all(
-        isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
+    if (
+        all(
+            isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+            for g in kv_cache_groups
+        )
+        or len({g.kv_cache_spec.page_size_bytes for g in kv_cache_groups}) > 1
     ):
+        # DeepseekV4, or Gemma-4 (#39133) hybrid with different natural page
+        # sizes: both use the bucketed (slot, page_size) tensor layout.
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
         return sum(ps * len(slots) for ps, slots in buckets.items())
@@ -1024,6 +1030,39 @@ def is_kv_cache_page_size_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool
 
     page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
     return len(page_sizes) == 1
+
+
+def is_hybrid_swa_full_different_page_size(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> bool:
+    """Whether this is a non-MLA hybrid of sliding-window + full attention whose
+    layers have *different* natural page sizes (the Gemma-4 case, #39133).
+
+    Gemma-4 mixes ``SlidingWindowSpec`` (head_dim=256) with ``FullAttentionSpec``
+    (head_dim=512), so the two spec types have different page sizes. Such models
+    fall through the general multi-group path, where ``unify_kv_cache_spec_page_size``
+    pads the smaller (global) page up to the larger (sliding) page, wasting memory
+    on the global layers. Instead we keep the natural page sizes and emit one
+    tensor per (slot, page_size) -- the same layout the DeepseekV4 allocator uses.
+
+    Uniform-page hybrids (e.g. Gemma-3, Llama-4 where sliding and full share the
+    same head_dim) return False here and keep their existing behavior. MLA models
+    are routed earlier by ``group_and_unify_kv_cache_specs`` and are excluded here
+    as well.
+    """
+    if is_kv_cache_page_size_uniform(kv_cache_spec):
+        return False
+    has_sliding_window = any(
+        isinstance(spec, SlidingWindowSpec) for spec in kv_cache_spec.values()
+    )
+    has_full_attention = any(
+        isinstance(spec, FullAttentionSpec) for spec in kv_cache_spec.values()
+    )
+    has_mla = any(
+        isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        for spec in kv_cache_spec.values()
+    )
+    return has_sliding_window and has_full_attention and not has_mla
 
 
 def unify_kv_cache_spec_page_size(
@@ -1244,6 +1283,152 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _sliding_page_sizes(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> set[int]:
+    """Page sizes (bytes) that belong to ``SlidingWindowSpec`` groups.
+
+    For the gemma-4 hybrid the sliding and global layers have *distinct* natural
+    page sizes (see ``get_kv_cache_groups``), so a tensor's bucket page size
+    uniquely identifies whether it is window-bounded (shallow pool) or global
+    (deep pool). This map is the single source of truth shared by the gemma-4
+    allocator and the cross-worker finalization.
+    """
+    return {
+        group.kv_cache_spec.page_size_bytes
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+    }
+
+
+def _get_kv_cache_config_gemma4_per_group(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor], list[int]]:
+    """Gemma-4 per-group KV pool depths (#39133).
+
+    Sliding-window groups are window-bounded, so they only ever need a *shallow*
+    pool of ``D_sw`` blocks (the per-request admission cap times the achievable
+    concurrency ``C``). Global groups must hold a full ``max_model_len`` request,
+    so they get a *deep* pool of ``D_global`` blocks. Emitting one tensor per
+    (slot, page_size) -- like the DeepseekV4 bucketed layout -- but sizing each
+    bucket to its class depth physically shrinks the sliding tensors, freeing
+    memory for a much deeper global pool.
+
+    Returns ``(legacy_num_blocks, kv_cache_tensors, per_group_num_blocks)``.
+    """
+    # buckets = {page_size: [[layer_names], [layer_names], ...]}
+    buckets = _bucket_layers_by_page_size(kv_cache_groups)
+    sliding_pages = _sliding_page_sizes(kv_cache_groups)
+
+    # Bucket SLOT counts (e.g. 8 sliding-page slots + 8 global-page slots),
+    # not layer counts: layers sharing a slot share one physical tensor.
+    s_per_block = sum(
+        ps * len(slots) for ps, slots in buckets.items() if ps in sliding_pages
+    )
+    g_per_block = sum(
+        ps * len(slots) for ps, slots in buckets.items() if ps not in sliding_pages
+    )
+
+    block_size = vllm_config.cache_config.block_size
+    max_model_len = vllm_config.model_config.max_model_len
+    maxlen_blocks = cdiv(max_model_len, block_size)
+
+    # Per-request admission cap (in blocks) for the window-bounded sliding pool.
+    sliding_spec = next(
+        group.kv_cache_spec
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+    )
+    admit_blocks = sliding_spec.max_admission_blocks_per_request(
+        vllm_config.scheduler_config.max_num_batched_tokens, max_model_len
+    )
+
+    # CRITICAL: the sliding pool is SHARED by every sliding-window group and the
+    # global pool by every full-attention group. gemma4 splits its 40 sliding
+    # layers into ``n_sliding_groups`` groups of ``group_size`` layers (e.g. 5
+    # groups of 8). Each group has an independent block table and reserves up to
+    # ``admit_blocks`` block-IDs per request, so the sliding pool's per-request
+    # demand is ``n_sliding_groups * admit_blocks`` -- NOT a single group's
+    # ``admit_blocks``. Sizing D_sw for one group under-provisions the pool by
+    # ``n_sliding_groups``x; when that drops below one request's demand the
+    # full-sequence admission gate in ``allocate_slots`` rejects EVERY request
+    # and the v1 scheduler spins forever at 0% GPU (the #39133 per-group
+    # follow-up). ``d_sw = c * sw_req_blocks >= sw_req_blocks`` guarantees a
+    # single request is always admissible.
+    n_sliding_groups = sum(
+        isinstance(g.kv_cache_spec, SlidingWindowSpec) for g in kv_cache_groups
+    )
+    n_global_groups = len(kv_cache_groups) - n_sliding_groups
+    sw_req_blocks = n_sliding_groups * admit_blocks  # per-request sliding demand
+    gl_req_blocks = n_global_groups * maxlen_blocks  # per-request global demand
+
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None or available_memory == 0:
+        # OVERRIDE / ZERO-MEMORY GUARD: skip the C-formula (it would divide by a
+        # budget that no longer reflects the real pool, or by zero). Preserve the
+        # per-group structure at minimal size. `may_override_num_blocks` returns
+        # the override when set, else `num_blocks` (here 0 for profiling).
+        d_global = may_override_num_blocks(vllm_config, 0)
+        # +1 for the null block (see the main branch); keep d_sw <= d_global so
+        # the minimal/profiling pool stays bounded. CAVEAT: a user-forced
+        # num_gpu_blocks_override below (sw_req_blocks + 1) leaves
+        # free (= d_sw - 1) < one request's sliding demand and can reintroduce
+        # the admission deadlock. This is a debug-only path (CUDA-graph
+        # profiling uses short dummy sequences whose demand is far below the
+        # override), so it is intentionally not guarded; production sizing goes
+        # through the main branch below.
+        d_sw = min(sw_req_blocks + 1, d_global) if d_global > 0 else 0
+    else:
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        denom = gl_req_blocks * g_per_block + sw_req_blocks * s_per_block
+        # Achievable concurrency: how many full-length sequences the budget can
+        # admit, capped by max_num_seqs and floored at 1.
+        c = max(1, min(max_num_seqs, available_memory // denom))
+        # Both pools scale with C *on purpose*: the global pool holds C full
+        # sequences and the sliding pool holds those same C requests' windows
+        # (sw_req_blocks each). Do NOT cap d_sw at one request's worth -- the
+        # sliding pool must match the global pool's concurrency, otherwise it
+        # becomes the admission limiter (the same asymmetry that caused the
+        # 0%-GPU deadlock this allocator fixes). Every sliding block-ID is used
+        # by one of the C concurrent requests, so none is wasted.
+        # +1 for the per-pool null block (block id 0 is reserved, so a pool of
+        # depth D exposes only D-1 *free* blocks). Without it, at C=1
+        # d_sw == sw_req_blocks but free == sw_req_blocks-1 < one request's
+        # demand -> the admission gate rejects the very first request and the
+        # scheduler spins (observed at 200K: free=964 < demand=965). free now
+        # == c*sw_req_blocks >= sw_req_blocks for c>=1.
+        d_sw = sw_req_blocks * c + 1
+        d_global = (available_memory - d_sw * s_per_block) // g_per_block
+        # d_global also exposes only d_global-1 free blocks (null), so require
+        # strictly more than one request's demand.
+        if d_global - 1 < gl_req_blocks:
+            raise ValueError(
+                "gemma4 per-group KV allocator cannot fit a single "
+                f"max_model_len={max_model_len} sequence: global pool depth "
+                f"D_global={d_global} < {gl_req_blocks} blocks required "
+                f"(available_memory={available_memory}, D_sw={d_sw}, "
+                f"n_sliding_groups={n_sliding_groups}, "
+                f"admit_blocks={admit_blocks}, s_per_block={s_per_block}, "
+                f"g_per_block={g_per_block})."
+            )
+
+    kv_cache_tensors: list[KVCacheTensor] = []
+    for ps, slots in buckets.items():
+        depth = d_sw if ps in sliding_pages else d_global
+        for slot in slots:
+            kv_cache_tensors.append(KVCacheTensor(size=ps * depth, shared_by=slot))
+
+    per_group_num_blocks = [
+        d_sw if isinstance(group.kv_cache_spec, SlidingWindowSpec) else d_global
+        for group in kv_cache_groups
+    ]
+    num_blocks = max(d_sw, d_global)
+
+    return num_blocks, kv_cache_tensors, per_group_num_blocks
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1269,6 +1454,8 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    # Per-group pool depths; only populated for the gemma-4 per-group allocator.
+    per_group_num_blocks: list[int] | None = None
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -1295,6 +1482,23 @@ def get_kv_cache_config_from_groups(
         # DeepseekV4: UniformTypeKVCacheSpecs but multiple groups.
         # Delegate to the DeepseekV4-specific allocator.
         num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
+            vllm_config, kv_cache_groups, available_memory
+        )
+    elif len({group.kv_cache_spec.page_size_bytes for group in kv_cache_groups}) > 1:
+        # Gemma-4 (#39133): non-MLA sliding-window + full hybrid with different
+        # natural page sizes. The page sizes were deliberately *not* unified
+        # (see `get_kv_cache_groups`), so emit one tensor per (slot, page_size)
+        # like the DeepseekV4 bucketed layout. This keeps the smaller global
+        # page at its natural size instead of padding it up to the sliding
+        # page, physically shrinking the global layers' KV cache. On top of
+        # that, the per-group allocator gives the window-bounded sliding groups
+        # a *shallow* pool (D_sw) and the global groups a *deep* pool
+        # (D_global), reported via `per_group_num_blocks`.
+        (
+            num_blocks,
+            kv_cache_tensors,
+            per_group_num_blocks,
+        ) = _get_kv_cache_config_gemma4_per_group(
             vllm_config, kv_cache_groups, available_memory
         )
     else:
@@ -1329,6 +1533,7 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        per_group_num_blocks=per_group_num_blocks,
     )
 
 
@@ -1677,10 +1882,18 @@ def get_kv_cache_groups(
         if not isinstance(v, HiddenStateCacheSpec)
     }
 
-    # As KVCacheManager can only allocate memory of one size, we need to unify
-    # the page size of the layers. For cases cannot be unified, this function
-    # will raise an error.
-    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+    # As KVCacheManager can only allocate memory of one size, we generally unify
+    # the page size of the layers. For cases that cannot be unified, this
+    # function will raise an error.
+    #
+    # Exception (#39133): a non-MLA sliding-window + full hybrid with different
+    # natural page sizes (Gemma-4). Unifying would pad the smaller global page up
+    # to the larger sliding page and over-allocate the global layers. Instead we
+    # keep natural page sizes and let `get_kv_cache_config_from_groups` emit one
+    # tensor per (slot, page_size) -- the same layout the DeepseekV4 allocator
+    # uses -- which physically shrinks the global layers' KV cache.
+    if not is_hybrid_swa_full_different_page_size(filtered_spec):
+        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
@@ -1782,9 +1995,23 @@ def _max_memory_usage_bytes_from_groups(
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
-    page_size = get_uniform_page_size(
-        [group.kv_cache_spec for group in kv_cache_groups]
-    )
+    page_sizes = {group.kv_cache_spec.page_size_bytes for group in kv_cache_groups}
+    if len(page_sizes) > 1:
+        # Gemma-4 (#39133): groups have different natural page sizes and are
+        # allocated with one (slot, page_size) tensor per group (the DeepseekV4
+        # bucketed layout). Each group reserves `group_size` slots sized at its
+        # own page, capped by its window/full max memory usage.
+        return sum(
+            group_size
+            * group.kv_cache_spec.page_size_bytes
+            * cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in kv_cache_groups
+        )
+
+    page_size = page_sizes.pop()
     blocks_needed = sum(
         cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size)
         for group in kv_cache_groups
@@ -2053,17 +2280,26 @@ def get_kv_cache_configs(
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
-    )
-    for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
+    if any(cfg.per_group_num_blocks is not None for cfg in kv_cache_configs):
+        # Per-group pool depths (gemma-4 per-group allocator): a single
+        # `num_blocks` no longer describes every tensor. A sliding-page tensor
+        # is shared by all sliding groups at depth D_sw; a global-page tensor by
+        # all global groups at depth D_global. Take the per-class (sliding vs
+        # global) min across workers and rescale each tensor by its own class
+        # ratio. When all workers are identical every ratio is 1 (no-op).
+        _finalize_per_group_num_blocks(vllm_config, kv_cache_configs)
+    else:
+        min_num_blocks = min(
+            kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        )
+        for kv_cache_config in kv_cache_configs:
+            num_blocks_old = kv_cache_config.num_blocks
+            kv_cache_config.num_blocks = min_num_blocks
 
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            # Shrink tensor size proportionally
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len
@@ -2083,6 +2319,85 @@ def get_kv_cache_configs(
             )
 
     return kv_cache_configs
+
+
+def _finalize_per_group_num_blocks(
+    vllm_config: VllmConfig,
+    kv_cache_configs: list[KVCacheConfig],
+) -> None:
+    """Cross-worker finalization for configs with per-group pool depths.
+
+    Each tensor's depth is keyed by its bucket *class* (sliding vs global),
+    identified by its page size, NOT by a single ``num_blocks``. We take the
+    per-class min across workers and rescale each tensor by ``min_class /
+    old_class`` for its own class. ``per_group_num_blocks`` is updated to the
+    per-class mins and ``num_blocks`` to ``max(per_group_num_blocks)``.
+    """
+    # Per-class (D_sw, D_global) depths each worker computed, from its groups.
+    sliding_depths: list[int] = []
+    global_depths: list[int] = []
+    for cfg in kv_cache_configs:
+        if cfg.per_group_num_blocks is None:
+            # Mixed worker shapes are not expected here (the allocator routes
+            # all workers of a gemma-4 deployment through the per-group path),
+            # but fall back to the legacy single depth so we never crash.
+            sliding_depths.append(cfg.num_blocks)
+            global_depths.append(cfg.num_blocks)
+            continue
+        s_d = [
+            n
+            for group, n in zip(cfg.kv_cache_groups, cfg.per_group_num_blocks)
+            if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        ]
+        g_d = [
+            n
+            for group, n in zip(cfg.kv_cache_groups, cfg.per_group_num_blocks)
+            if not isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        ]
+        # Per-class depths are uniform within a worker by construction.
+        sliding_depths.append(s_d[0] if s_d else cfg.num_blocks)
+        global_depths.append(g_d[0] if g_d else cfg.num_blocks)
+
+    min_sliding = min(sliding_depths)
+    min_global = min(global_depths)
+
+    for cfg, old_sliding, old_global in zip(
+        kv_cache_configs, sliding_depths, global_depths
+    ):
+        # Unambiguous per-layer classification: a layer is sliding iff it lives
+        # in a SlidingWindowSpec group. A tensor's class follows its layers
+        # (every layer sharing a tensor has the same page size / class).
+        sliding_layers = {
+            layer_name
+            for group in cfg.kv_cache_groups
+            if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            for layer_name in group.layer_names
+        }
+        for tensor in cfg.kv_cache_tensors:
+            is_sliding = bool(tensor.shared_by) and tensor.shared_by[0] in sliding_layers
+            if is_sliding:
+                old_class, min_class = old_sliding, min_sliding
+            else:
+                old_class, min_class = old_global, min_global
+            assert tensor.size % old_class == 0
+            tensor.size = tensor.size // old_class * min_class
+
+        cfg.per_group_num_blocks = [
+            min_sliding if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            else min_global
+            for group in cfg.kv_cache_groups
+        ]
+        cfg.num_blocks = max(cfg.per_group_num_blocks)
+
+        if len(cfg.kv_cache_groups) > 0:
+            max_model_len = vllm_config.model_config.max_model_len
+            num_tokens, max_concurrency = get_kv_cache_capacity(vllm_config, cfg)
+            logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
+            logger.info_once(
+                "Maximum concurrency for %s tokens per request: %.2fx",
+                f"{max_model_len:,}",
+                max_concurrency,
+            )
 
 
 class BlockHashListWithBlockSize:

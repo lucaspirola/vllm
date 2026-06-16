@@ -6968,6 +6968,19 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
+            # Block-table WIDTH (columns per request) is sized by the logical
+            # position span, NOT by the group's pool depth -- even for a sliding
+            # group. The slot-mapping kernel indexes the block-table row by
+            # ``block_indices = pos // (block_size * cp)`` (see
+            # ``_compute_slot_mapping_kernel`` in block_table.py), where ``pos``
+            # can reach ``max_model_len - 1`` for ANY layer; a sliding layer's
+            # out-of-window columns hold the null block (0), but the row must
+            # still span that full index range. Narrowing a sliding group's
+            # width to its shallow pool depth (``D_sw``) would therefore truncate
+            # the row and OOB-read it for sequences longer than ``D_sw`` blocks.
+            # So we intentionally keep the full ``cdiv(max_model_len, ...)``
+            # width for every group (correct and cheap; the KV memory savings
+            # already come from the per-group pool DEPTHS in G2/G3, not here).
             max_num_blocks_per_req = cdiv(
                 max_model_len, block_size * get_total_cp_world_size()
             )

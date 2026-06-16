@@ -869,6 +869,18 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    per_group_num_blocks: list[int] | None = None
+    """Optional per-group block counts. When set, ``per_group_num_blocks[i]`` is
+    the number of blocks for kv cache group ``i`` (allowing each group its own
+    pool depth). When ``None`` (the default), all groups use ``num_blocks``."""
+
+    def num_blocks_for_group(self, i: int) -> int:
+        """Return the number of KV cache blocks for group ``i``."""
+        return (
+            self.per_group_num_blocks[i]
+            if self.per_group_num_blocks is not None
+            else self.num_blocks
+        )
 
     @property
     def has_mamba_layers(self) -> bool:

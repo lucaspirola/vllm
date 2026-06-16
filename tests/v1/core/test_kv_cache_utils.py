@@ -19,6 +19,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
@@ -1776,7 +1777,22 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # Different hidden size and different type, align by different block size
+    # Different hidden size and different type (full + sliding window with
+    # different natural page sizes, the Gemma-4 shape, #39133). This hits the
+    # gemma-4 per-group allocator (G2): keep each group's natural page size and
+    # emit one tensor per (slot, page_size), but size each bucket to its *class*
+    # depth -- a shallow window-bounded pool (D_sw) for the sliding group and a
+    # deep pool (D_global) for the global group -- reported via
+    # `per_group_num_blocks`.
+    #
+    # full page 16384, sliding page 8192; max_model_len=16 -> maxlen_blocks=1;
+    # admit_blocks (window=1, max_num_batched_tokens=2048) = 2.
+    # g_per_block = 16384, s_per_block = 8192, denom = 1*16384 + 2*8192 = 32768;
+    # C = min(max_num_seqs=128, 524288 // 32768) = 16; D_sw = 2*16 = 32;
+    # D_global = (524288 - 32*8192) // 16384 = 16. (Here the tiny max_model_len
+    # makes the global pool the *shallow* one and the window-bounded sliding
+    # pool the deep one -- the inverse of the gemma-4 200K case, but the
+    # per-class sizing machinery is identical.)
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64),
         "layer_2": new_sliding_window_spec(head_size=32),
@@ -1784,31 +1800,62 @@ def test_get_kv_cache_config_one_worker():
     kv_cache_config_hybrid = get_kv_cache_configs(
         vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 32]
     )[0]
+    # D_sw = 2*16 + 1 = 33 (+1 for the null block so free=D_sw-1=32 >= one
+    # request's sliding demand sw_req=2); D_global = (524288 - 33*8192) //
+    # 16384 = 15 (free=14 >= gl_req=1). num_blocks = max(33, 15) = 33.
+    # (C=16 here, so free has ample slack; the tight C=1 regime where the
+    # null-block off-by-one actually deadlocks is covered by the dedicated
+    # test_gemma4_sliding_pool_no_admission_deadlock / _per_group_pool_depths.)
     assert kv_cache_config_hybrid == KVCacheConfig(
-        num_blocks=32,
+        num_blocks=33,
         kv_cache_tensors=[
+            # full (global) layer: page 16384 x D_global=15
+            KVCacheTensor(size=mem_per_block_per_layer * 15, shared_by=["layer_1"]),
+            # sliding layer: page 8192 x D_sw=33
             KVCacheTensor(
-                size=mem_per_block_per_layer * 32, shared_by=["layer_1", "layer_2"]
+                size=(mem_per_block_per_layer // 2) * 33, shared_by=["layer_2"]
             ),
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(["layer_1"], new_kv_cache_spec(head_size=64)),
-            KVCacheGroupSpec(
-                ["layer_2"], new_sliding_window_spec(head_size=32, block_size=32)
-            ),
+            KVCacheGroupSpec(["layer_2"], new_sliding_window_spec(head_size=32)),
         ],
+        per_group_num_blocks=[15, 33],
     )
 
-    # different hidden size that cannot be aligned by using different block size
+    # Different hidden size that cannot be page-aligned by adjusting block_size
+    # (page 24576 is not a multiple of 16384). The bucketed (slot, page_size)
+    # layout handles any set of page sizes; with the gemma-4 per-group allocator
+    # each group is sized to its class depth.
+    # full page 16384, sliding page 24576; max_model_len=16 -> maxlen_blocks=1;
+    # admit_blocks = 2; g_per_block = 16384, s_per_block = 24576;
+    # denom = 1*16384 + 2*24576 = 65536; available = 16384*2*32 = 1048576;
+    # C = min(128, 1048576 // 65536) = 16; D_sw = 2*16 + 1 = 33 (+1 null block,
+    # free=32 >= sw_req=2); D_global = (1048576 - 33*24576) // 16384 = 14
+    # (free=13 >= gl_req=1); num_blocks = max(33, 14) = 33.
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64),
         "layer_2": new_sliding_window_spec(head_size=96),
     }
-
-    with pytest.raises(NotImplementedError):
-        get_kv_cache_configs(
-            vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
-        )[0]
+    kv_cache_config_hybrid = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
+    )[0]
+    assert kv_cache_config_hybrid == KVCacheConfig(
+        num_blocks=33,
+        kv_cache_tensors=[
+            # full (global) layer: page 16384 x D_global=14
+            KVCacheTensor(size=mem_per_block_per_layer * 14, shared_by=["layer_1"]),
+            # sliding layer: page 24576 x D_sw=33
+            KVCacheTensor(
+                size=(mem_per_block_per_layer * 3 // 2) * 33, shared_by=["layer_2"]
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer_1"], new_kv_cache_spec(head_size=64)),
+            KVCacheGroupSpec(["layer_2"], new_sliding_window_spec(head_size=96)),
+        ],
+        per_group_num_blocks=[14, 33],
+    )
 
     # Test num_gpu_blocks_override
     vllm_config.cache_config.num_gpu_blocks_override = 16
@@ -1823,6 +1870,266 @@ def test_get_kv_cache_config_one_worker():
         ],
         kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], new_kv_cache_spec())],
     )
+
+
+def _physical_bytes_per_layer(kv_cache_config: KVCacheConfig) -> dict[str, float]:
+    """Attribute each KVCacheTensor's physical bytes across the layers sharing it.
+
+    A ``KVCacheTensor`` is a single physical buffer shared by the layers listed
+    in ``shared_by`` (they have disjoint block-id namespaces). We split its
+    ``size`` evenly across those layers to get a per-layer physical-byte budget.
+    """
+    per_layer: dict[str, float] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        share = len(tensor.shared_by)
+        assert share > 0
+        for layer_name in tensor.shared_by:
+            per_layer[layer_name] = per_layer.get(layer_name, 0.0) + tensor.size / share
+    return per_layer
+
+
+def test_gemma4_hybrid_swa_physically_capped():
+    """Gemma-4 hybrid (SWA + global) with different page sizes (#39133).
+
+    Gemma-4 mixes 40 sliding-window layers (head_dim=256, 8 KV heads) with 8
+    global/full-attention layers (head_dim=512, 1 KV head). The two spec types
+    have *different* page sizes, so this model falls through the general
+    multi-group allocator path. The sliding layers' KV is window-bounded
+    (``SlidingWindowSpec.max_memory_usage_bytes`` is capped at the 1024-token
+    window), while the global layers scale with ``max_model_len``. The allocator
+    must therefore give each sliding layer a *physically smaller* block budget
+    than each global layer instead of one shared num_blocks for every layer.
+    """
+    # max_model_len well above the sliding window so the window cap dominates:
+    # a global layer's budget scales with 32768 tokens while a sliding layer's
+    # is bounded by the 1024-token window (+ chunked-prefill batch).
+    model_config = ModelConfig(max_model_len=32768)
+    vllm_config = VllmConfig(model_config=model_config)
+
+    # 48 layers; the 8 global layers sit at the Gemma-4 global indices.
+    global_indices = {5, 11, 17, 23, 29, 35, 41, 47}
+    kv_cache_spec: dict[str, KVCacheSpec] = {}
+    for i in range(48):
+        name = f"layer_{i}"
+        if i in global_indices:
+            kv_cache_spec[name] = new_kv_cache_spec(num_kv_heads=1, head_size=512)
+        else:
+            kv_cache_spec[name] = new_sliding_window_spec(
+                num_kv_heads=8, head_size=256, sliding_window=1024
+            )
+
+    a_global = "layer_5"
+    a_sliding = "layer_0"
+    global_spec = kv_cache_spec[a_global]
+    sliding_spec = kv_cache_spec[a_sliding]
+    # Precondition for the bug: the per-spec window cap is strictly below the
+    # full-attention budget, so a correct allocator must allocate less for the
+    # sliding layer.
+    assert sliding_spec.max_memory_usage_bytes(
+        vllm_config
+    ) < global_spec.max_memory_usage_bytes(vllm_config)
+
+    available_memory = 4 * GiB_bytes
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config, [kv_cache_spec], [available_memory]
+    )[0]
+
+    per_layer_bytes = _physical_bytes_per_layer(kv_cache_config)
+    sliding_bytes = per_layer_bytes[a_sliding]
+    global_bytes = per_layer_bytes[a_global]
+
+    # The core #39133 contract: a window-bounded sliding layer must receive a
+    # smaller per-layer KV-cache allocation than a global layer. Before the fix
+    # the general allocator padded every layer up to the (larger) sliding page
+    # and shared one num_blocks across all groups, so a sliding layer and a
+    # global layer received identical bytes. The fix keeps each group's natural
+    # page size and emits one tensor per (slot, page_size) -- the DeepseekV4
+    # bucketed layout -- so the global layers are no longer over-padded.
+    #
+    # NOTE: vLLM uses a single shared block pool of `num_blocks` blocks indexed
+    # by a global block-id space, so every layer's physical tensor must be sized
+    # for `num_blocks` to stay in bounds; the sliding-window memory saving is
+    # realized through the runtime admission cap (more concurrency), not a
+    # physically under-sized tensor. The per-layer figure above is the amortized
+    # share of each (slot, page_size) tensor across the layers sharing it.
+    assert sliding_bytes < global_bytes, (
+        f"sliding layer got {sliding_bytes} bytes, global layer got "
+        f"{global_bytes} bytes; sliding KV must be smaller than global KV"
+    )
+
+
+def test_gemma4_per_group_pool_depths():
+    """Gemma-4 per-group KV pool depths (G2, #39133).
+
+    The per-group allocator must give the window-bounded sliding groups a
+    *shallow* pool (D_sw) and the global groups a *deep* pool (D_global),
+    reported via ``KVCacheConfig.per_group_num_blocks``. Each (slot, page_size)
+    tensor is physically sized to its class depth, and the total must never
+    exceed the available pool.
+    """
+    # max_model_len well above the sliding window (1024) so the sliding pool is
+    # window-bounded (shallow) while the global pool must hold a full-length
+    # request (deep): D_sw << D_global.
+    max_model_len = 32768
+    model_config = ModelConfig(max_model_len=max_model_len)
+    vllm_config = VllmConfig(model_config=model_config)
+    block_size = vllm_config.cache_config.block_size
+
+    # 48 layers: 8 global at the Gemma-4 global indices, 40 sliding-window.
+    global_indices = {5, 11, 17, 23, 29, 35, 41, 47}
+    kv_cache_spec: dict[str, KVCacheSpec] = {}
+    for i in range(48):
+        name = f"layer_{i}"
+        if i in global_indices:
+            kv_cache_spec[name] = new_kv_cache_spec(num_kv_heads=1, head_size=512)
+        else:
+            kv_cache_spec[name] = new_sliding_window_spec(
+                num_kv_heads=8, head_size=256, sliding_window=1024
+            )
+
+    sliding_page = kv_cache_spec["layer_0"].page_size_bytes
+    global_page = kv_cache_spec["layer_5"].page_size_bytes
+    assert sliding_page != global_page
+
+    available_memory = 4 * GiB_bytes
+    cfg = get_kv_cache_configs(vllm_config, [kv_cache_spec], [available_memory])[0]
+
+    # 6 kv_cache_groups: 5 SlidingWindowSpec + 1 FullAttentionSpec.
+    assert len(cfg.kv_cache_groups) == 6
+    n_sliding_groups = sum(
+        isinstance(g.kv_cache_spec, SlidingWindowSpec) for g in cfg.kv_cache_groups
+    )
+    assert n_sliding_groups == 5
+
+    # per_group_num_blocks populated with 6 entries: 5 x D_sw + 1 x D_global.
+    assert cfg.per_group_num_blocks is not None
+    assert len(cfg.per_group_num_blocks) == 6
+    sliding_depths = {
+        n
+        for g, n in zip(cfg.kv_cache_groups, cfg.per_group_num_blocks)
+        if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+    }
+    global_depths = {
+        n
+        for g, n in zip(cfg.kv_cache_groups, cfg.per_group_num_blocks)
+        if not isinstance(g.kv_cache_spec, SlidingWindowSpec)
+    }
+    assert len(sliding_depths) == 1 and len(global_depths) == 1
+    d_sw = sliding_depths.pop()
+    d_global = global_depths.pop()
+
+    # NO-DEADLOCK INVARIANT (#39133 per-group follow-up): the sliding pool must
+    # hold at least ONE request's full sliding demand = n_sliding_groups x
+    # admit_blocks. Each sliding group has its own block table and reserves up to
+    # admit_blocks per request, so the shared sliding pool needs the SUM across
+    # groups. If D_sw < this, the full-sequence admission gate rejects every
+    # request and the scheduler spins forever at 0% GPU.
+    admit_blocks = kv_cache_spec["layer_0"].max_admission_blocks_per_request(
+        vllm_config.scheduler_config.max_num_batched_tokens, max_model_len
+    )
+    # free = D_sw - 1 (block id 0 is the reserved null block); the FIRST
+    # request's full sliding demand must fit that free count, else the gate
+    # rejects request #1 and the scheduler spins (observed free=964 < 965).
+    assert d_sw - 1 >= n_sliding_groups * admit_blocks, (
+        f"free(D_sw-1)={d_sw - 1} < per-request sliding demand "
+        f"{n_sliding_groups} x {admit_blocks} = {n_sliding_groups * admit_blocks}"
+        " -> admission deadlock"
+    )
+    # ...and the per-request, per-group sliding reservation is window-bounded:
+    # each sliding group reserves only `admit_blocks` (~window + one batch),
+    # strictly less than a full-length request's `maxlen_blocks` -- that
+    # per-request saving is the whole point of Gap B. (D_sw itself scales with
+    # concurrency C, so D_sw vs maxlen_blocks is NOT a fixed relationship; the
+    # genuine invariant is the per-request reservation below.)
+    assert admit_blocks < cdiv(max_model_len, block_size), (
+        f"sliding per-group reservation admit_blocks={admit_blocks} not "
+        f"window-bounded below full-length {cdiv(max_model_len, block_size)}"
+    )
+    # Global pool must hold one full-length request.
+    assert d_global >= cdiv(max_model_len, block_size)
+
+    # Each tensor is sized page x (D_sw for sliding-page, D_global for global).
+    sliding_sizes = {
+        t.size for t in cfg.kv_cache_tensors if t.size % sliding_page == 0
+        and t.size // sliding_page == d_sw
+    }
+    global_sizes = {
+        t.size for t in cfg.kv_cache_tensors if t.size % global_page == 0
+        and t.size // global_page == d_global
+    }
+    for t in cfg.kv_cache_tensors:
+        if t.shared_by[0] == "layer_0":
+            assert t.size == sliding_page * d_sw
+        if t.shared_by[0] == "layer_5":
+            assert t.size == global_page * d_global
+    assert sliding_sizes == {sliding_page * d_sw}
+    assert global_sizes == {global_page * d_global}
+
+    # Hard budget: physical tensors must never exceed the available pool.
+    total = sum(t.size for t in cfg.kv_cache_tensors)
+    assert total <= available_memory, (
+        f"total KV tensor bytes {total} exceed available {available_memory}"
+    )
+
+    # Legacy num_blocks is the deep (global) depth.
+    assert cfg.num_blocks == max(d_sw, d_global) == d_global
+
+
+def test_gemma4_sliding_pool_no_admission_deadlock(monkeypatch):
+    """Regression for the #39133 per-group follow-up deadlock.
+
+    At large max_model_len the achievable concurrency C is small (1-2). The
+    original sizing set ``D_sw = admit_blocks * C`` -- a SINGLE group's demand --
+    but the sliding pool is shared by all ``n_sliding_groups`` groups (gemma4: 5),
+    so one request's true demand is ``n_sliding_groups * admit_blocks``. With
+    C < n_sliding_groups, ``D_sw`` fell BELOW one request's demand, the
+    full-sequence admission gate rejected every request, and the v1 scheduler
+    spun forever at 0% GPU (observed: demand=1330 > D_sw free=1153 at
+    max_model_len=98304). D_sw must be >= the per-request sliding demand.
+    """
+    # The deadlock was observed in production at max_model_len=98304 (demand
+    # 1330 > D_sw 1153). We test at 65536, which physically FITS at 4.66 GiB so
+    # the config loads (rather than vLLM's _check_enough_kv_cache_memory
+    # rejecting it upfront) and we can assert the positive no-deadlock invariant.
+    # 65536 > the dummy model's max_position_embeddings (40960), so allow it.
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    max_model_len = 65536
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=max_model_len))
+    global_indices = {5, 11, 17, 23, 29, 35, 41, 47}
+    kv_cache_spec: dict[str, KVCacheSpec] = {}
+    for i in range(48):
+        if i in global_indices:
+            kv_cache_spec[f"layer_{i}"] = new_kv_cache_spec(num_kv_heads=1, head_size=512)
+        else:
+            kv_cache_spec[f"layer_{i}"] = new_sliding_window_spec(
+                num_kv_heads=8, head_size=256, sliding_window=1024
+            )
+    # ~4.66 GiB: the real RTX-5080 KV pool after ~10 GB weights. With the old
+    # formula this produced D_sw=1154 < demand 2885 (deadlock); the fix gives
+    # C=1, D_sw = n_sliding_groups * admit_blocks.
+    available_memory = int(4.66 * GiB_bytes)
+    cfg = get_kv_cache_configs(vllm_config, [kv_cache_spec], [available_memory])[0]
+
+    n_sliding_groups = sum(
+        isinstance(g.kv_cache_spec, SlidingWindowSpec) for g in cfg.kv_cache_groups
+    )
+    admit_blocks = kv_cache_spec["layer_0"].max_admission_blocks_per_request(
+        vllm_config.scheduler_config.max_num_batched_tokens, max_model_len
+    )
+    d_sw = next(
+        n
+        for g, n in zip(cfg.kv_cache_groups, cfg.per_group_num_blocks)
+        if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+    )
+    # The invariant the deadlock violated: one request must be admissible
+    # against the pool's FREE count (D_sw - 1, excluding the null block).
+    assert d_sw - 1 >= n_sliding_groups * admit_blocks, (
+        f"free(D_sw-1)={d_sw - 1} < per-request demand "
+        f"{n_sliding_groups}*{admit_blocks}={n_sliding_groups * admit_blocks}"
+        " -> admission deadlock"
+    )
+    # And the config must still physically fit the pool.
+    assert sum(t.size for t in cfg.kv_cache_tensors) <= available_memory
 
 
 def test_get_kv_cache_configs_attention_free():
@@ -2414,3 +2721,50 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+def test_kvcacheconfig_per_group_num_blocks_defaults():
+    ref_kv_cache_spec = new_kv_cache_spec()
+
+    # (a) Built WITHOUT the new field -> per_group_num_blocks is None.
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=ref_kv_cache_spec.page_size_bytes * 10, shared_by=["layer1"]
+            ),
+            KVCacheTensor(
+                size=ref_kv_cache_spec.page_size_bytes * 10, shared_by=["layer2"]
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer1"], ref_kv_cache_spec),
+            KVCacheGroupSpec(["layer2"], ref_kv_cache_spec),
+        ],
+    )
+    assert config.per_group_num_blocks is None
+
+    # (b) Accessor falls back to num_blocks when the field is unset.
+    assert config.num_blocks_for_group(0) == config.num_blocks
+    assert config.num_blocks_for_group(1) == config.num_blocks
+
+    # (b) Accessor returns per_group_num_blocks[i] when set.
+    config_with_per_group = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=ref_kv_cache_spec.page_size_bytes * 10, shared_by=["layer1"]
+            ),
+            KVCacheTensor(
+                size=ref_kv_cache_spec.page_size_bytes * 10, shared_by=["layer2"]
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer1"], ref_kv_cache_spec),
+            KVCacheGroupSpec(["layer2"], ref_kv_cache_spec),
+        ],
+        per_group_num_blocks=[3, 7],
+    )
+    assert config_with_per_group.per_group_num_blocks == [3, 7]
+    assert config_with_per_group.num_blocks_for_group(0) == 3
+    assert config_with_per_group.num_blocks_for_group(1) == 7

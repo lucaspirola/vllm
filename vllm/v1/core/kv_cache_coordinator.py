@@ -87,13 +87,79 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
 
-        self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
-        )
+        # Build one BlockPool per distinct per-group budget. When
+        # ``per_group_num_blocks`` is None (the common case), this collapses to a
+        # single pool sized to ``num_blocks`` -- byte-identical to the legacy
+        # path. When set (gemma4 per-group depths), groups sharing the same
+        # depth share a pool, so gemma4's 5xD_sw + 1xD_global config yields
+        # exactly two pools (a shallow sliding pool and a deep global pool).
+        # ``_group_to_pool`` maps each kv cache group id to its routed pool;
+        # ``self.block_pool`` is the primary pool, kept for legacy single-pool
+        # readers (e.g. KV-connector binding) that predate per-group pools.
+        def _make_pool(depth: int) -> BlockPool:
+            return BlockPool(
+                num_gpu_blocks=depth,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+            )
+
+        per_group = kv_cache_config.per_group_num_blocks
+        if per_group is None:
+            self.block_pool = _make_pool(kv_cache_config.num_blocks)
+            self.block_pools: list[BlockPool] = [self.block_pool]
+            self._group_to_pool: list[BlockPool] = [
+                self.block_pool
+                for _ in range(len(kv_cache_config.kv_cache_groups))
+            ]
+        else:
+            # One pool per distinct depth, in stable first-seen order. Dedup
+            # keys on the depth VALUE (``num_blocks_for_group(i)``), not the spec
+            # class: if two distinct specs ever shared the same budget they would
+            # intentionally share one pool, which is consistent for read/write
+            # routing (depth is the only thing that sizes a pool's id space).
+            depth_to_pool: dict[int, BlockPool] = {}
+            self.block_pools = []
+            self._group_to_pool = []
+            for i in range(len(kv_cache_config.kv_cache_groups)):
+                depth = kv_cache_config.num_blocks_for_group(i)
+                pool = depth_to_pool.get(depth)
+                if pool is None:
+                    pool = _make_pool(depth)
+                    depth_to_pool[depth] = pool
+                    self.block_pools.append(pool)
+                self._group_to_pool.append(pool)
+            self.block_pool = self.block_pools[0]
+
+        # The "global" pool is the one whose admission check must additionally
+        # reserve blocks for in-flight prefills (the ``reserved_blocks`` scalar
+        # the scheduler passes into ``allocate_slots``). Those reserved blocks
+        # are remaining full-ISL blocks of running prefills -- overwhelmingly
+        # full-attention (the binding, full-depth resource), so we charge them
+        # only against the full-attention pool. Selection rule (clearest correct
+        # form that reduces EXACTLY to legacy for one pool):
+        #   * one pool          -> that pool (legacy: full reserved on the lone
+        #                          pool, byte-identical);
+        #   * multiple pools    -> the pool backing a ``FullAttentionSpec``
+        #                          (full-attention family) group; if somehow no
+        #                          pool is full-attention, fall back to the
+        #                          deepest pool (largest id space) -- still the
+        #                          most binding resource.
+        if len(self.block_pools) == 1:
+            self.global_pool = self.block_pools[0]
+        else:
+            full_attn_pools = [
+                self._group_to_pool[i]
+                for i, g in enumerate(kv_cache_config.kv_cache_groups)
+                if isinstance(g.kv_cache_spec, FullAttentionSpec)
+            ]
+            if full_attn_pools:
+                self.global_pool = full_attn_pools[0]
+            else:
+                self.global_pool = max(
+                    self.block_pools, key=lambda p: p.num_gpu_blocks
+                )
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -108,7 +174,7 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.pool_for_group(i),
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -125,6 +191,67 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
+
+    def pool_for_group(self, i: int) -> BlockPool:
+        """Return the ``BlockPool`` that backs kv cache group ``i``.
+
+        Groups sharing the same per-group budget share a pool. With a single
+        (uniform) pool this always returns ``self.block_pool``.
+        """
+        return self._group_to_pool[i]
+
+    def get_num_blocks_to_allocate_per_pool(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> dict[BlockPool, int]:
+        """Per-pool block demand for the request.
+
+        Same semantics and args as ``get_num_blocks_to_allocate``, but instead
+        of summing every group's demand into one scalar, it accumulates each
+        group's demand into the bucket of THAT group's routed pool
+        (``pool_for_group(i)``). A request that needs ``N_global`` blocks from
+        the global pool and ``N_sliding`` from the sliding pool must fit EACH
+        pool independently, so the admission gate checks every returned bucket
+        against its own free count.
+
+        With a single (uniform) pool this returns ``{block_pool: total}``, where
+        ``total`` equals ``get_num_blocks_to_allocate(...)`` exactly.
+
+        Returns:
+            Mapping from ``BlockPool`` to the number of blocks that pool must
+            allocate for this request. Pools with zero demand are still present
+            (every distinct pool appears once, initialized to 0).
+        """
+        per_pool: dict[BlockPool, int] = {pool: 0 for pool in self.block_pools}
+        for i, manager in enumerate(self.single_type_managers):
+            pool = self._group_to_pool[i]
+            if isinstance(manager, CrossAttentionManager):
+                # For cross-attention, we issue a single static allocation
+                # of blocks based on the number of encoder input tokens.
+                per_pool[pool] += manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_encoder_tokens,
+                    [],
+                    0,
+                    num_encoder_tokens,
+                    apply_admission_cap=apply_admission_cap,
+                )
+            else:
+                per_pool[pool] += manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks[i],
+                    total_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                )
+        return per_pool
 
     def get_num_blocks_to_allocate(
         self,
@@ -157,31 +284,21 @@ class KVCacheCoordinator(ABC):
                 leave it False so the predictor matches `allocate_new_blocks`.
 
         Returns:
-            The number of blocks to allocate.
+            The number of blocks to allocate (summed across all pools). The
+            scheduler depends on this returning an ``int`` (see
+            ``_request_remaining_blocks`` / ``_inflight_prefill_reserved_blocks``).
         """
-        num_blocks_to_allocate = 0
-        for i, manager in enumerate(self.single_type_managers):
-            if isinstance(manager, CrossAttentionManager):
-                # For cross-attention, we issue a single static allocation
-                # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_encoder_tokens,
-                    [],
-                    0,
-                    num_encoder_tokens,
-                    apply_admission_cap=apply_admission_cap,
-                )
-            else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_tokens,
-                    new_computed_blocks[i],
-                    total_computed_tokens,
-                    num_tokens_main_model,
-                    apply_admission_cap=apply_admission_cap,
-                )
-        return num_blocks_to_allocate
+        return sum(
+            self.get_num_blocks_to_allocate_per_pool(
+                request_id=request_id,
+                num_tokens=num_tokens,
+                new_computed_blocks=new_computed_blocks,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=total_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+                apply_admission_cap=apply_admission_cap,
+            ).values()
+        )
 
     def allocate_new_computed_blocks(
         self,
@@ -688,11 +805,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
                     )
+                # All groups in a spec-group share one spec and therefore one
+                # per-group budget, so they share a pool; read from that pool.
+                # (Write-side ``cache_blocks`` already uses each manager's own
+                # routed ``self.block_pool``.)
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
+                    block_pool=self.pool_for_group(group_ids[0]),
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self.scheduler_block_size,

@@ -185,7 +185,23 @@ class KVCacheManager:
         Returns:
             The KV cache usage (between 0.0 and 1.0).
         """
-        return self.block_pool.get_usage()
+        # Aggregate across all per-group pools as global block occupancy:
+        # total used (non-null) blocks / total (non-null) blocks. With a single
+        # pool this is identical to ``BlockPool.get_usage()``.
+        pools = self.coordinator.block_pools
+        if len(pools) == 1:
+            return pools[0].get_usage()
+        total = 0
+        free = 0
+        for pool in pools:
+            # ``num_gpu_blocks - 1`` excludes the per-pool null block, which is
+            # never in the free queue, so ``get_num_free_blocks()`` already
+            # counts only free non-null blocks (mirrors ``get_usage``).
+            total += pool.num_gpu_blocks - 1
+            free += pool.get_num_free_blocks()
+        if total == 0:
+            return 0.0
+        return 1.0 - (free / total)
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -373,18 +389,33 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=full_num_tokens,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_tokens_main_model=full_num_tokens,
-                apply_admission_cap=True,
+            per_pool_to_allocate = (
+                self.coordinator.get_num_blocks_to_allocate_per_pool(
+                    request_id=request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                )
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
-                return None
+            # Each pool's demand must fit ITS own free blocks. A single summed
+            # check would wrongly admit a request that fits in aggregate but
+            # overflows one pool (e.g. global demand exceeds the deep pool while
+            # the shallow sliding pool has slack). The ``watermark_blocks``
+            # preemption headroom is a property of the full-depth global pool
+            # (the sliding pool recycles within its window), so charge it there
+            # only. With one (uniform) pool, ``global_pool`` is that pool, so
+            # this reduces EXACTLY to the legacy
+            # ``num_blocks_to_allocate + watermark_blocks > free`` check.
+            global_pool = self.coordinator.global_pool
+            for pool, num_blocks_to_allocate in per_pool_to_allocate.items():
+                required_blocks = num_blocks_to_allocate
+                if pool is global_pool:
+                    required_blocks += watermark_blocks
+                if required_blocks > pool.get_num_free_blocks():
+                    return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
@@ -401,23 +432,39 @@ class KVCacheManager:
             request.request_id, total_computed_tokens
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-            request_id=request.request_id,
-            num_tokens=num_tokens_need_slot,
-            new_computed_blocks=new_computed_block_list,
-            num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=num_local_computed_tokens
-            + num_external_computed_tokens,
-            num_tokens_main_model=num_tokens_main_model,
+        per_pool_to_allocate = (
+            self.coordinator.get_num_blocks_to_allocate_per_pool(
+                request_id=request.request_id,
+                num_tokens=num_tokens_need_slot,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=num_local_computed_tokens
+                + num_external_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+            )
         )
 
-        # Keep `reserved_blocks` free for other in-flight sequences, and an
-        # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
-            # Cannot allocate new blocks
-            return None
+        # Each pool's demand must fit ITS own free blocks. ``reserved_blocks``
+        # (free blocks held back for other in-flight prefills) and the
+        # ``watermark_blocks`` preemption headroom are both charged only against
+        # the global pool: those reservations are remaining full-ISL blocks of
+        # running prefills, which are overwhelmingly full-attention -- the
+        # binding, full-depth resource. Charging them to the global pool only
+        # never over-admits global; the sliding pool is checked on its raw free
+        # count (it recycles within its window and is not the constraint they
+        # guard). With one (uniform) pool, ``global_pool`` is that pool, so this
+        # reduces EXACTLY to the legacy single-pool check
+        # ``num_blocks_to_allocate + watermark_blocks > free - reserved_blocks``.
+        global_pool = self.coordinator.global_pool
+        for pool, num_blocks_to_allocate in per_pool_to_allocate.items():
+            available_blocks = pool.get_num_free_blocks()
+            required_blocks = num_blocks_to_allocate
+            if pool is global_pool:
+                available_blocks -= reserved_blocks
+                required_blocks += watermark_blocks
+            if required_blocks > available_blocks:
+                # Cannot allocate new blocks
+                return None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -499,7 +546,25 @@ class KVCacheManager:
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
-        self.block_pool.evict_blocks(block_ids)
+        pools = self.coordinator.block_pools
+        if len(pools) == 1:
+            self.block_pool.evict_blocks(block_ids)
+            return
+        # Per-group pools each number blocks ``0..depth-1`` independently, so a
+        # block id is NOT globally unique across pools. Fanning an id to every
+        # pool is therefore NOT intrinsically safe: a same-id block that is
+        # *cached* in another pool would be wrongly evicted. It is safe here only
+        # because the sole caller -- the KV-connector invalid-block path
+        # (``scheduler._handle_invalid_blocks`` via
+        # ``kv_connector_output.invalid_block_ids``, which is None for gemma4) --
+        # is single-group / non-hybrid upstream and is never reached when
+        # multiple pools exist. Until that path supports the hybrid allocator,
+        # route each id only to pools where it is in range
+        # (``BlockPool.evict_blocks`` no-ops for uncached ids).
+        for pool in pools:
+            in_range = {bid for bid in block_ids if bid < pool.num_gpu_blocks}
+            if in_range:
+                pool.evict_blocks(in_range)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -510,7 +575,14 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if not self.block_pool.reset_prefix_cache():
+        # Reset every per-group pool (don't short-circuit, so each pool is
+        # actually cleared) and succeed only if all of them reset. With a single
+        # pool this is identical to the legacy single-pool reset.
+        success = True
+        for pool in self.coordinator.block_pools:
+            if not pool.reset_prefix_cache():
+                success = False
+        if not success:
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -557,7 +629,15 @@ class KVCacheManager:
         Returns:
             A list of KV cache events.
         """
-        events = self.block_pool.take_events()
+        # Merge events across all per-group pools. With a single pool this is
+        # identical to ``self.block_pool.take_events()``.
+        pools = self.coordinator.block_pools
+        if len(pools) == 1:
+            events = pools[0].take_events()
+        else:
+            events = []
+            for pool in pools:
+                events.extend(pool.take_events())
         for event in events:
             if not isinstance(event, BlockStored):
                 continue
