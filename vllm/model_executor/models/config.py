@@ -80,6 +80,66 @@ class Gemma4Config(VerifyAndUpdateConfig):
 
         max_head_dim = max(head_dim, global_head_dim)
 
+        # int4 KV (turboquant) path: only the global (full-attention,
+        # head_dim=512) layers carry int4 TURBOQUANT KV; the window-bounded
+        # sliding layers stay native bf16 (they have no TURBOQUANT kernel). Do
+        # NOT force a single FA4/Triton backend here -- globals -> TURBOQUANT,
+        # sliding -> TRITON_ATTN, and TurboQuant overrides flash_attn_version to
+        # 2 regardless, so the FA-vs-Triton divergence the forcing below guards
+        # against does not arise. Adjust the per-layer skip list and return
+        # before the backend-forcing logic.
+        #
+        # ``cache_dtype`` must already be the *resolved* dtype string here
+        # (e.g. "turboquant_4bit_nc"): arg_utils resolves it before constructing
+        # CacheConfig and this hook runs later in VllmConfig post-init; a
+        # refactor moving verification ahead of resolution would silently
+        # disable this branch.
+        kv_cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", None)
+        is_turboquant = isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith(
+            "turboquant_"
+        )
+        if is_turboquant and max_head_dim > 256:
+            # Two adjustments to the per-layer skip list:
+            #   1. Add the "sliding_window" sentinel so every sliding layer is
+            #      bf16 (-> TRITON_ATTN).
+            #   2. Drop any *global* layer index that TurboQuant boundary
+            #      protection (skip first/last N attention layers) may have added
+            #      upstream. That heuristic assumes a dense stack of contiguous
+            #      attention layers; here only the sparse globals are quantized,
+            #      so skipping by absolute index (e.g. the last layer) wrongly
+            #      forces a single global to bf16. That lone odd-dtype spec also
+            #      collapses the per-group KV pool grouping (one spec-type with a
+            #      single layer -> group_size 1), and a bf16 512-dim global costs
+            #      ~2 KB/token -- unaffordable at 200K. Keep every global int4 so
+            #      they share one uniform spec/group.
+            layer_types = getattr(hf_text_config, "layer_types", None) or []
+            global_idxs = {
+                str(i) for i, t in enumerate(layer_types) if t == "full_attention"
+            }
+            if not global_idxs:
+                logger.warning(
+                    "Gemma4 int4 KV: no 'full_attention' layers found in "
+                    "layer_types=%r; cannot strip boundary-skip from global "
+                    "layers. int4 KV may fail to fit at long context.",
+                    layer_types,
+                )
+            skip = [
+                s
+                for s in vllm_config.cache_config.kv_cache_dtype_skip_layers
+                if s not in global_idxs
+            ]
+            if "sliding_window" not in skip:
+                skip.append("sliding_window")
+            vllm_config.cache_config.kv_cache_dtype_skip_layers = skip
+            logger.info(
+                "Gemma4 heterogeneous head dims with int4 KV (%s): keeping "
+                "sliding-window layers in native bf16 (TRITON_ATTN) and routing "
+                "all global layers to int4 TURBOQUANT (skip_layers=%s).",
+                kv_cache_dtype,
+                skip,
+            )
+            return
+
         if is_fa_version_supported(4) and max_head_dim <= 512:
             if (
                 vllm_config.attention_config.flash_attn_version is None

@@ -61,6 +61,13 @@ _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
+# FlashAttention's forward kernel only supports head dimensions up to 256.
+# Layers with a larger head_size (e.g. Gemma-4 global attention, head_dim=512)
+# must use the non-FA prefill paths (SDPA / TQ Triton decode). FA is only used
+# for prefill in this backend; decode always runs the Triton TQ kernel, which
+# has no such limit.
+_FLASH_ATTN_MAX_HEAD_SIZE = 256
+
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
 # do_kv_cache_update already stored all tokens to TQ cache, so the decode
@@ -171,6 +178,19 @@ class TurboQuantAttentionBackend(AttentionBackend):
         # head_size from spec is effective_head_size (padded_slot//2),
         # not the model's actual head_dim. Accept any positive value.
         return head_size > 0
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # TURBOQUANT serves only DECODER full-attention layers and does plain
+        # causal full attention (it never reads mm_prefix_range -- grep shows
+        # zero references). The multimodal-bidirectional ("mm prefix") models
+        # that pair int4 KV with this backend, notably Gemma-4, CLEAR
+        # mm_prefix_range for their full-attention layers
+        # (Gemma4 _clear_mm_prefix_for_full_attn_layers), so plain full attention
+        # is the correct behavior for the layers this backend gets. Declaring
+        # support unblocks int4 KV on those global layers; coherence is verified
+        # end-to-end (long-context fact retrieval) rather than assumed.
+        return True
 
 
 @dataclass
@@ -287,6 +307,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Detect flash-attn version (FA2/3/4) for prefill paths.
         self.fa_version = get_flash_attn_version(head_size=head_size)
+
+        # FlashAttention caps head_dim at 256. For larger heads (Gemma-4
+        # globals use head_dim=512) the prefill must fall back to SDPA / the
+        # TQ Triton paths instead of flash_attn_varlen.
+        self._prefill_use_flash = (
+            _HAS_FLASH_ATTN and head_size <= _FLASH_ATTN_MAX_HEAD_SIZE
+        )
 
         # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
         # and benchmarks show no regression vs dynamic in eager mode).
@@ -556,6 +583,41 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_fp8=self.tq_config.key_fp8,
         )
 
+    def _decode_chunk(
+        self,
+        q_sub: torch.Tensor,  # (nq, Hq, D)
+        kv_cache: torch.Tensor,
+        block_table_row: torch.Tensor,  # (1, max_num_blocks)
+        synth_seq_lens: torch.Tensor,  # (nq,) causal length per query
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the TQ decode kernel for a contiguous window of prefill queries.
+
+        Each query is treated as an independent decode request reading the TQ
+        cache up to its causal length. The caller tiles a large continuation
+        chunk into windows and calls this once per window; bounding the window
+        size keeps the kernel's split-K scratch bounded.
+        """
+        nq = q_sub.shape[0]
+        synth_bt = block_table_row.expand(nq, -1)
+        return triton_turboquant_decode_attention(
+            query=q_sub,
+            kv_cache=kv_cache,
+            block_table=synth_bt,
+            seq_lens=synth_seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=self.scale,
+            mse_bits=self.tq_config.key_mse_bits,
+            key_packed_size=self.tq_config.key_packed_size,
+            value_quant_bits=self.tq_config.effective_value_quant_bits,
+            key_fp8=self.tq_config.key_fp8,
+            norm_correction=self.tq_config.norm_correction,
+            PiT=PiT,
+        )
+
     # ------------------------------------------------------------------ #
     #  Prefill: SDPA on raw Q/K/V with causal mask                        #
     # ------------------------------------------------------------------ #
@@ -576,7 +638,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
-        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
+        if (
+            self._prefill_use_flash
+            and attn_metadata.max_query_len == attn_metadata.max_seq_len
+        ):
             return self._flash_attn_varlen(
                 q=query,
                 k=key,
@@ -637,7 +702,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
-                if _HAS_FLASH_ATTN:
+                if self._prefill_use_flash:
                     # Assign to slice to avoid gpu/cpu sync.
                     self._cu_2[1:2] = q_len
                     cu = self._cu_2
@@ -664,32 +729,48 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     ).transpose(0, 1)
                 output[q_start:q_end] = out.to(query.dtype)
             else:
-                # Continuation chunk: tokens already stored to TQ cache
-                # by do_kv_cache_update. Use decode kernel directly to
-                # avoid O(cached_len) full-dequant per continuation.
-                # For large continuations, fall back to _continuation_prefill.
+                # Continuation chunk: tokens already stored to TQ cache by
+                # do_kv_cache_update. Three routes:
+                #   - small chunk            -> single decode-kernel call
+                #   - large chunk, head>256  -> tiled decode (memory-bounded)
+                #   - large chunk, head<=256 -> _continuation_prefill (FA)
                 cached_len = seq_len - q_len
+                block_table_row = attn_metadata.block_table[i : i + 1]
                 if q_len <= _CONTINUATION_DECODE_THRESHOLD:
                     # Fast path: treat each query as a decode request
                     # with incremental seq_lens for causal masking.
                     # Slice from pre-built arange (no kernel launch)
                     synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
-                    synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
-                    out = triton_turboquant_decode_attention(
-                        query=q_seq,
-                        kv_cache=kv_cache,
-                        block_table=synth_bt,
-                        seq_lens=synth_seq_lens,
-                        Pi=Pi,
-                        centroids=centroids,
-                        scale=self.scale,
-                        mse_bits=self.tq_config.key_mse_bits,
-                        key_packed_size=self.tq_config.key_packed_size,
-                        value_quant_bits=(self.tq_config.effective_value_quant_bits),
-                        key_fp8=self.tq_config.key_fp8,
-                        norm_correction=self.tq_config.norm_correction,
-                        PiT=PiT,
+                    out = self._decode_chunk(
+                        q_seq, kv_cache, block_table_row, synth_seq_lens, Pi, centroids, PiT
                     )
+                elif self.head_size > _FLASH_ATTN_MAX_HEAD_SIZE:
+                    # Large-head layers (e.g. Gemma-4 globals, head_dim=512) have
+                    # no FlashAttention kernel, and _continuation_prefill's SDPA
+                    # fallback would materialize the full (Hq, q_len, seq_len)
+                    # score matrix -- GiBs at chunk size 2560, and unscalable to
+                    # 200K. A single decode call over all q_len queries instead
+                    # makes the kernel's split-K scratch scale with q_len (also
+                    # OOMs). So tile the decode over q_len in windows of
+                    # _CONTINUATION_DECODE_THRESHOLD: scratch stays bounded
+                    # regardless of context length. The per-window Python loop is
+                    # a one-time prefill cost (decode is the steady-state hot
+                    # path), an accepted trade for memory safety.
+                    for s in range(0, q_len, _CONTINUATION_DECODE_THRESHOLD):
+                        e = min(s + _CONTINUATION_DECODE_THRESHOLD, q_len)
+                        synth_seq_lens = _arange_cache[
+                            cached_len + s + 1 : cached_len + e + 1
+                        ]
+                        output[q_start + s : q_start + e] = self._decode_chunk(
+                            q_seq[s:e],
+                            kv_cache,
+                            block_table_row,
+                            synth_seq_lens,
+                            Pi,
+                            centroids,
+                            PiT,
+                        ).to(query.dtype)
+                    continue
                 else:
                     # Large continuation: dequant cached K/V and use
                     # flash_attn for better throughput.
@@ -699,7 +780,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         k_seq,
                         v_seq,
                         kv_cache,
-                        attn_metadata.block_table[i : i + 1],
+                        block_table_row,
                         cached_len,
                         seq_len,
                         Pi,
@@ -813,7 +894,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v_full[cached_len:] = val_chunk
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
-        if _HAS_FLASH_ATTN:
+        if self._prefill_use_flash:
             # Reuse pre-allocated cu_seqlens (avoid host→device transfer)
             if not hasattr(self, "_cu_2_q"):
                 self._cu_2_q = torch.zeros(2, device=device, dtype=torch.int32)
