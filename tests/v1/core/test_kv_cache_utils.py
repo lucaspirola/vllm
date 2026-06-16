@@ -2075,6 +2075,105 @@ def test_gemma4_per_group_pool_depths():
     assert cfg.num_blocks == max(d_sw, d_global) == d_global
 
 
+def test_gemma4_sliding_int4_per_group_pool_depths():
+    """Gemma-4 per-group pools with int4 TurboQuant on BOTH sliding and global
+    layers (TQSlidingWindowSpec + TQFullAttentionSpec; VLLM_TQ_SLIDING_WINDOW=1).
+
+    Verifies the int4 sliding spec (a) groups with itself and separately from
+    the int4 globals (6 groups, 2 distinct page sizes), (b) uses the packed TQ
+    slot page -- far smaller than bf16 -- and (c) keeps the Gap-B per-group
+    depths + the no-admission-deadlock invariant.
+    """
+    from vllm.v1.kv_cache_interface import (
+        TQFullAttentionSpec,
+        TQSlidingWindowSpec,
+    )
+
+    max_model_len = 32768
+    model_config = ModelConfig(max_model_len=max_model_len)
+    vllm_config = VllmConfig(model_config=model_config)
+    block_size = vllm_config.cache_config.block_size
+
+    # turboquant_4bit_nc slot sizes: head_dim=512 -> 518, head_dim=256 -> 262.
+    GLOBAL_SLOT = 518
+    SLIDING_SLOT = 262
+
+    global_indices = {5, 11, 17, 23, 29, 35, 41, 47}
+    kv_cache_spec: dict[str, KVCacheSpec] = {}
+    for i in range(48):
+        name = f"layer_{i}"
+        if i in global_indices:
+            kv_cache_spec[name] = TQFullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.bfloat16,
+                tq_slot_size=GLOBAL_SLOT,
+            )
+        else:
+            kv_cache_spec[name] = TQSlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=8,
+                head_size=256,
+                dtype=torch.bfloat16,
+                sliding_window=1024,
+                tq_slot_size=SLIDING_SLOT,
+            )
+
+    sliding_page = kv_cache_spec["layer_0"].page_size_bytes
+    global_page = kv_cache_spec["layer_5"].page_size_bytes
+    # int4 TQ page uses the packed slot, NOT head_size * dtype.
+    assert sliding_page == block_size * 8 * SLIDING_SLOT
+    assert global_page == block_size * 1 * GLOBAL_SLOT
+    assert sliding_page != global_page
+    # The point of sliding-int4: the page is ~4x smaller than the bf16 sliding
+    # page (block_size * 8 * (256 + 256) * 2 bytes).
+    bf16_sliding_page = block_size * 8 * (256 + 256) * 2
+    assert sliding_page < bf16_sliding_page / 3
+
+    available_memory = 4 * GiB_bytes
+    cfg = get_kv_cache_configs(vllm_config, [kv_cache_spec], [available_memory])[0]
+
+    # 6 groups: 5 sliding (TQSlidingWindowSpec) + 1 global (TQFullAttentionSpec).
+    assert len(cfg.kv_cache_groups) == 6
+    n_sliding_groups = sum(
+        isinstance(g.kv_cache_spec, SlidingWindowSpec) for g in cfg.kv_cache_groups
+    )
+    assert n_sliding_groups == 5
+    # Exactly two distinct page sizes across the groups (sliding-int4 vs
+    # global-int4), and they are the TQ-slot pages.
+    page_sizes = {g.kv_cache_spec.page_size_bytes for g in cfg.kv_cache_groups}
+    assert page_sizes == {sliding_page, global_page}
+
+    assert cfg.per_group_num_blocks is not None
+    assert len(cfg.per_group_num_blocks) == 6
+    sliding_depths = {
+        n
+        for g, n in zip(cfg.kv_cache_groups, cfg.per_group_num_blocks)
+        if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+    }
+    global_depths = {
+        n
+        for g, n in zip(cfg.kv_cache_groups, cfg.per_group_num_blocks)
+        if not isinstance(g.kv_cache_spec, SlidingWindowSpec)
+    }
+    assert len(sliding_depths) == 1 and len(global_depths) == 1
+    d_sw = sliding_depths.pop()
+    d_global = global_depths.pop()
+
+    # Same no-deadlock invariant as the bf16 sliding case: the shared sliding
+    # pool must hold one request's full sliding demand across all 5 groups.
+    admit_blocks = kv_cache_spec["layer_0"].max_admission_blocks_per_request(
+        vllm_config.scheduler_config.max_num_batched_tokens, max_model_len
+    )
+    assert d_sw - 1 >= n_sliding_groups * admit_blocks
+    assert d_global >= cdiv(max_model_len, block_size)
+
+    # Hard budget: physical tensors never exceed the available pool.
+    total = sum(t.size for t in cfg.kv_cache_tensors)
+    assert total <= available_memory
+
+
 def test_gemma4_sliding_pool_no_admission_deadlock(monkeypatch):
     """Regression for the #39133 per-group follow-up deadlock.
 

@@ -623,3 +623,123 @@ class TestStoreDecodeRoundTrip:
             assert cos_sim > threshold, (
                 f"Preset {preset} head {h}: cosine_sim={cos_sim:.4f} < {threshold}"
             )
+
+    def test_sliding_window_decode_ignores_out_of_window(self):
+        """TQ decode with sliding_window attends ONLY to the last W keys.
+
+        Property test (no bf16 reference needed): a windowed decode's output
+        must be INVARIANT to cache content outside [seq_len - W, seq_len) --
+        covering both the leading stale/NULL region AND the boundary block's
+        out-of-window tokens -- yet still DEPEND on in-window content. Without
+        the window, that same out-of-window content DOES change the output
+        (proving the slots are real and read, so the window mask is what
+        excludes them). This is the correctness contract for routing
+        TURBOQUANT onto gemma4's sliding-window layers (VLLM_TQ_SLIDING_WINDOW).
+        """
+        from vllm.model_executor.layers.quantization.turboquant.centroids import (
+            solve_lloyd_max,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_decode import (
+            triton_turboquant_decode_attention,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_store import (
+            triton_turboquant_store,
+        )
+
+        preset = "turboquant_4bit_nc"
+        cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=256)
+        D = 256
+        Hk = Hq = 4
+        block_size = 16
+        W = 64  # sliding window
+        seq_len = 200  # > 2*W; win_start = 136 straddles block 8 ([128,144))
+        win_start = seq_len - W
+        num_blocks = (seq_len + block_size - 1) // block_size
+        device = torch.device(DEVICE_TYPE)
+
+        H = _build_hadamard(D, DEVICE_TYPE)
+        Pi = PiT = H
+        centroids, _ = solve_lloyd_max(D, cfg.centroid_bits)
+        centroids = centroids.float().to(device)
+        c_sorted, _ = centroids.sort()
+        midpoints = ((c_sorted[:-1] + c_sorted[1:]) / 2).to(device)
+
+        kv_cache = torch.zeros(
+            num_blocks, block_size, Hk, cfg.slot_size_aligned,
+            device=device, dtype=torch.uint8,
+        )
+        block_table = torch.arange(
+            num_blocks, device=device, dtype=torch.int32
+        ).unsqueeze(0)
+        seq_lens = torch.tensor([seq_len], device=device, dtype=torch.int32)
+        torch.manual_seed(7)
+        query = torch.randn(1, Hq, D, device=device, dtype=torch.float16)
+
+        def store(k, v, start):
+            n = k.shape[0]
+            triton_turboquant_store(
+                k, v, kv_cache,
+                torch.arange(start, start + n, device=device, dtype=torch.int32),
+                PiT, midpoints,
+                mse_bits=cfg.key_mse_bits,
+                key_packed_size=cfg.key_packed_size,
+                value_quant_bits=cfg.effective_value_quant_bits,
+                key_fp8=cfg.key_fp8,
+            )
+
+        def decode(window):
+            return triton_turboquant_decode_attention(
+                query=query, kv_cache=kv_cache, block_table=block_table,
+                seq_lens=seq_lens, Pi=Pi, centroids=centroids,
+                scale=1.0 / math.sqrt(D),
+                mse_bits=cfg.key_mse_bits,
+                key_packed_size=cfg.key_packed_size,
+                value_quant_bits=cfg.effective_value_quant_bits,
+                key_fp8=cfg.key_fp8, norm_correction=cfg.norm_correction,
+                PiT=PiT, max_num_kv_splits=4, sliding_window=window,
+            ).float().clone()
+
+        # Fixed in-window K/V; first out-of-window fill (A).
+        torch.manual_seed(1)
+        k_in = torch.randn(W, Hk, D, device=device, dtype=torch.float16)
+        v_in = torch.randn(W, Hk, D, device=device, dtype=torch.float16)
+        k_oow_a = torch.randn(win_start, Hk, D, device=device, dtype=torch.float16)
+        v_oow_a = torch.randn(win_start, Hk, D, device=device, dtype=torch.float16)
+        store(k_oow_a, v_oow_a, 0)
+        store(k_in, v_in, win_start)
+        o_win_a = decode(W)
+        o_full_a = decode(0)
+
+        # Overwrite ONLY the out-of-window region with different content (B).
+        torch.manual_seed(2)
+        k_oow_b = torch.randn(win_start, Hk, D, device=device, dtype=torch.float16)
+        v_oow_b = torch.randn(win_start, Hk, D, device=device, dtype=torch.float16)
+        store(k_oow_b, v_oow_b, 0)
+        o_win_b = decode(W)
+        o_full_b = decode(0)
+
+        # (1) Windowed output is invariant to out-of-window content: the kernel
+        # reads the SAME in-window slots and skips/masks everything < win_start
+        # (boundary block included), so the result is essentially identical.
+        assert torch.allclose(o_win_a, o_win_b, atol=1e-3, rtol=1e-3), (
+            f"windowed decode leaked out-of-window content: "
+            f"max|Δ|={(o_win_a - o_win_b).abs().max().item():.4g}"
+        )
+        # (2) Without the window, out-of-window content DOES change the output
+        # -- proving those slots are real and read (so (1) is the mask working,
+        # not dead slots).
+        assert not torch.allclose(o_full_a, o_full_b, atol=1e-2), (
+            "no-window decode ignored out-of-window content; the property test "
+            "is vacuous"
+        )
+        # (3) In-window content matters: changing an in-window token changes the
+        # windowed output (guards against a window that reads nothing).
+        k_in2 = k_in.clone()
+        k_in2[W - 1] = torch.randn(Hk, D, device=device, dtype=torch.float16)
+        v_in2 = v_in.clone()
+        v_in2[W - 1] = torch.randn(Hk, D, device=device, dtype=torch.float16)
+        store(k_in2, v_in2, win_start)
+        o_win_c = decode(W)
+        assert not torch.allclose(o_win_a, o_win_c, atol=1e-2), (
+            "windowed decode did not depend on an in-window token"
+        )
