@@ -529,6 +529,36 @@ class SlidingWindowSpec(AttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class TQSlidingWindowSpec(SlidingWindowSpec):
+    """SlidingWindowSpec with TQ-aware (int4 TurboQuant) page size.
+
+    The sliding-window analogue of TQFullAttentionSpec: keeps
+    SlidingWindowSpec's window-capped memory sizing and grouping (so the
+    SlidingWindowManager still evicts out-of-window blocks and the pool is
+    sized to ~one window), but the physical page uses the packed TQ slot
+    instead of the raw ``head_size * dtype`` formula. ``tq_slot_size`` already
+    accounts for the quant scale/zero bytes, so ``kv_quant_mode`` stays NONE to
+    avoid double-counting page bytes.
+    """
+
+    tq_slot_size: int = 0
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.tq_slot_size > 0:
+            return self.block_size * self.num_kv_heads * self.tq_slot_size
+        return super().real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        assert all(s.tq_slot_size == specs[0].tq_slot_size for s in specs), (
+            "All TQ layers in the same KV cache group must use the same tq_slot_size."
+        )
+        return replace(merged, tq_slot_size=specs[0].tq_slot_size)
+
+
+@dataclass(frozen=True, kw_only=True)
 class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 

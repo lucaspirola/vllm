@@ -288,6 +288,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        # Per-layer sliding window (None for full-attention layers). For a
+        # windowed layer the decode/prefill paths must mask keys older than
+        # ``sliding_window`` -- the block table fed to the kernel is the full
+        # context with stale NULL-block leading entries, so block eviction
+        # alone does not bound attention. Stored per-impl (per-layer), NOT in
+        # the shared TurboQuantMetadata (layers may have different windows).
+        self.sliding_window = sliding_window
 
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
@@ -332,6 +339,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         max_seqlen_q: int,
         max_seqlen_k: int,
     ) -> torch.Tensor:
+        # Left-only causal window for sliding layers; (-1, -1) = unbounded
+        # (full causal), matching flash_attn's default for full-attention.
+        window_size = (
+            (self.sliding_window - 1, 0)
+            if self.sliding_window is not None
+            else (-1, -1)
+        )
         # fa_utils.get_flash_attn_version() returns None on backends that
         # should not pass an explicit fa_version kwarg.
         if self.fa_version is None:
@@ -345,6 +359,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.scale,
                 causal=True,
+                window_size=window_size,
             )
         return flash_attn_varlen_func(
             q=q,
@@ -357,6 +372,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             softmax_scale=self.scale,
             causal=True,
             fa_version=self.fa_version,
+            window_size=window_size,
         )
 
     def _ensure_on_device(self, layer, device):
@@ -616,6 +632,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_fp8=self.tq_config.key_fp8,
             norm_correction=self.tq_config.norm_correction,
             PiT=PiT,
+            sliding_window=self.sliding_window,
         )
 
     # ------------------------------------------------------------------ #
@@ -719,14 +736,30 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     q_t = q_seq.transpose(0, 1).contiguous()
                     k_t = k_seq.transpose(0, 1).contiguous()
                     v_t = v_seq.transpose(0, 1).contiguous()
-                    out = F.scaled_dot_product_attention(
-                        q_t,
-                        k_t,
-                        v_t,
-                        is_causal=True,
-                        scale=self.scale,
-                        enable_gqa=use_gqa,
-                    ).transpose(0, 1)
+                    if self.sliding_window is not None:
+                        # First-chunk: query i (== key i) attends to keys
+                        # [i - W + 1, i]. Explicit windowed-causal mask.
+                        pos = torch.arange(q_len, device=query.device)
+                        m = (pos[:, None] >= pos[None, :]) & (
+                            pos[None, :] > pos[:, None] - self.sliding_window
+                        )
+                        out = F.scaled_dot_product_attention(
+                            q_t,
+                            k_t,
+                            v_t,
+                            attn_mask=m,
+                            scale=self.scale,
+                            enable_gqa=use_gqa,
+                        ).transpose(0, 1)
+                    else:
+                        out = F.scaled_dot_product_attention(
+                            q_t,
+                            k_t,
+                            v_t,
+                            is_causal=True,
+                            scale=self.scale,
+                            enable_gqa=use_gqa,
+                        ).transpose(0, 1)
                 output[q_start:q_end] = out.to(query.dtype)
             else:
                 # Continuation chunk: tokens already stored to TQ cache by
@@ -923,6 +956,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
             k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
             mask = k_pos <= q_pos  # (q_len, seq_len)
+            if self.sliding_window is not None:
+                # Left-only window: exclude keys older than the window.
+                mask = mask & (k_pos > q_pos - self.sliding_window)
             out = F.scaled_dot_product_attention(
                 q_t,
                 k_t,
@@ -983,5 +1019,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf=lse_buf,
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
+            sliding_window=self.sliding_window,
         )
         return result

@@ -570,6 +570,35 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        if self.sliding_window is not None and self.kv_cache_dtype.startswith(
+            "turboquant_"
+        ):
+            # int4 TurboQuant KV on a sliding-window layer. Must precede the
+            # plain SlidingWindowSpec branch below (which would otherwise claim
+            # every sliding layer and make TQ-sliding unreachable). Only fires
+            # when the layer kept its turboquant_ dtype, i.e. the model config
+            # did NOT add "sliding_window" to kv_cache_dtype_skip_layers (the
+            # opt-in gate); otherwise the dtype was forced to "auto" upstream.
+            assert not vllm_config.model_config.use_mla, (
+                "MLA is not supported for slidingwindow"
+            )
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+            from vllm.v1.kv_cache_interface import TQSlidingWindowSpec
+
+            tq_config = TurboQuantConfig.from_cache_dtype(
+                self.kv_cache_dtype, self.head_size
+            )
+            return TQSlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                sliding_window=self.sliding_window,
+                tq_slot_size=tq_config.slot_size_aligned,
+            )
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"

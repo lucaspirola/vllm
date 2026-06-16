@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -100,8 +101,12 @@ class Gemma4Config(VerifyAndUpdateConfig):
         )
         if is_turboquant and max_head_dim > 256:
             # Two adjustments to the per-layer skip list:
-            #   1. Add the "sliding_window" sentinel so every sliding layer is
-            #      bf16 (-> TRITON_ATTN).
+            #   1. The sliding layers: by default keep them native bf16 (->
+            #      TRITON_ATTN) via the "sliding_window" sentinel, because the
+            #      TURBOQUANT kernels apply no window mask. The opt-in env
+            #      VLLM_TQ_SLIDING_WINDOW=1 routes them to int4 too
+            #      (TQSlidingWindowSpec + windowed TQ kernels) for ~2x more
+            #      concurrency at long context.
             #   2. Drop any *global* layer index that TurboQuant boundary
             #      protection (skip first/last N attention layers) may have added
             #      upstream. That heuristic assumes a dense stack of contiguous
@@ -123,19 +128,44 @@ class Gemma4Config(VerifyAndUpdateConfig):
                     "layers. int4 KV may fail to fit at long context.",
                     layer_types,
                 )
-            skip = [
-                s
-                for s in vllm_config.cache_config.kv_cache_dtype_skip_layers
-                if s not in global_idxs
-            ]
-            if "sliding_window" not in skip:
-                skip.append("sliding_window")
+            tq_sliding = os.environ.get("VLLM_TQ_SLIDING_WINDOW", "0").lower() not in (
+                "0",
+                "",
+                "false",
+                "no",
+            )
+            if tq_sliding:
+                # Opt-in max-concurrency mode: EVERY attention layer goes int4.
+                # Drop the "sliding_window" sentinel AND all boundary-protection
+                # layer indices (gemma4 layers are all attention, so a leftover
+                # sliding boundary index like '0'/'1'/'46' would force a lone
+                # bf16 sliding layer -- wasting memory and splintering the
+                # per-group KV pool grouping). Keep only non-index, non-sentinel
+                # skip entries (e.g. a user-specified non-numeric tag).
+                skip = [
+                    s
+                    for s in vllm_config.cache_config.kv_cache_dtype_skip_layers
+                    if not s.isdigit() and s != "sliding_window"
+                ]
+            else:
+                # Default: globals int4, sliding layers native bf16. Strip any
+                # global boundary index (else a lone bf16 global splinters the
+                # grouping) and add the sliding sentinel.
+                skip = [
+                    s
+                    for s in vllm_config.cache_config.kv_cache_dtype_skip_layers
+                    if s not in global_idxs
+                ]
+                if "sliding_window" not in skip:
+                    skip.append("sliding_window")
             vllm_config.cache_config.kv_cache_dtype_skip_layers = skip
             logger.info(
-                "Gemma4 heterogeneous head dims with int4 KV (%s): keeping "
-                "sliding-window layers in native bf16 (TRITON_ATTN) and routing "
+                "Gemma4 heterogeneous head dims with int4 KV (%s): %s; routing "
                 "all global layers to int4 TURBOQUANT (skip_layers=%s).",
                 kv_cache_dtype,
+                "sliding layers ALSO int4 (TQSlidingWindowSpec)"
+                if tq_sliding
+                else "keeping sliding-window layers in native bf16 (TRITON_ATTN)",
                 skip,
             )
             return

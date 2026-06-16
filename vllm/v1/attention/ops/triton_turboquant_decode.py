@@ -83,6 +83,7 @@ def _tq_decode_stage1(
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    SLIDING_WINDOW: tl.constexpr = 0,  # >0 = left-only window of this size
 ):
     bid = tl.program_id(0)  # batch index
     hid = tl.program_id(1)  # q_head index
@@ -105,6 +106,36 @@ def _tq_decode_stage1(
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < HEAD_DIM
     kv_range = tl.arange(0, BLOCK_KV)
+
+    # Sliding window: a decode query at position seq_len-1 with a left-only
+    # window of size W attends to keys in [seq_len - W, seq_len). SLIDING_WINDOW
+    # == 0 disables this (win_start = 0 -> every change below is a no-op, so the
+    # full-attention path is byte-identical).
+    if SLIDING_WINDOW > 0:
+        win_start = tl.maximum(seq_len - SLIDING_WINDOW, 0)
+    else:
+        win_start = 0
+    if split_end <= win_start:
+        # This split is entirely out of window. stage2 still reads it (its
+        # original split_start < seq_len), so write an empty partial rather than
+        # leaving Mid_o uninitialized. The lse must be a large FINITE negative,
+        # NOT -inf: stage2's online softmax computes exp(e_max - n_e_max), and a
+        # -inf lse combined with the -inf initial e_max yields -inf-(-inf)=NaN,
+        # corrupting the accumulator. -1e30 makes exp(-1e30 - real_max) underflow
+        # cleanly to 0 (zero weight) with no NaN. (Cannot bare-return like the
+        # beyond-seq_len case above, which stage2 skips.)
+        oob_base = bid * stride_mid_b + hid * stride_mid_h + sid * stride_mid_s
+        tl.store(
+            Mid_o_ptr + oob_base + d_offs,
+            tl.zeros([BLOCK_D], dtype=tl.float32),
+            mask=d_mask,
+        )
+        tl.store(Mid_o_ptr + oob_base + HEAD_DIM, -1e30)
+        return
+    # Skip tiles entirely below the window (perf: avoid iterating ~200K keys
+    # when only ~W are in-window). The boundary tile is kept and masked per
+    # position below.
+    loop_start = tl.maximum(split_start, win_start)
 
     # Load query vector: q_rot — [BLOCK_D] float32
     q_base = bid * stride_qb + hid * stride_qh
@@ -133,9 +164,14 @@ def _tq_decode_stage1(
     # ================================================================
     # TILED LOOP: process BLOCK_KV tokens per iteration
     # ================================================================
-    for start_n in range(split_start, split_end, BLOCK_KV):
+    for start_n in range(loop_start, split_end, BLOCK_KV):
         kv_offs = start_n + kv_range
-        kv_mask = kv_offs < split_end
+        # Per-position window mask is MANDATORY at the boundary tile: the block
+        # straddling win_start holds both in- and out-of-window tokens, and
+        # block-granular eviction cannot null the out-of-window ones. For
+        # SLIDING_WINDOW == 0, win_start == 0 so this is just ``kv_offs <
+        # split_end`` (unchanged).
+        kv_mask = (kv_offs < split_end) & (kv_offs >= win_start)
 
         page_idx = kv_offs // BLOCK_SIZE
         page_off = kv_offs % BLOCK_SIZE
@@ -503,6 +539,7 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    sliding_window: int | None = None,  # >0 = left-only window; None/0 = full
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -583,6 +620,7 @@ def triton_turboquant_decode_attention(
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
+        SLIDING_WINDOW=sliding_window or 0,
         num_warps=1,
         num_stages=1,
     )
