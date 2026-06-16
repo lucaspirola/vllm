@@ -23,6 +23,8 @@ from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
@@ -763,12 +765,24 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 output[q_start:q_end] = out.to(query.dtype)
             else:
                 # Continuation chunk: tokens already stored to TQ cache by
-                # do_kv_cache_update. Three routes:
-                #   - small chunk            -> single decode-kernel call
-                #   - large chunk, head>256  -> tiled decode (memory-bounded)
-                #   - large chunk, head<=256 -> _continuation_prefill (FA)
+                # do_kv_cache_update. Two routes:
+                #   - small chunk -> single decode-kernel call
+                #   - large chunk -> _continuation_prefill: dequant the cached
+                #     KV ONCE, then attend (flash for head<=256; memory-bounded
+                #     mem-efficient SDPA per query head for head>256 globals).
+                #     This replaces the old O(N^2) per-window tiled-decode, which
+                #     re-dequantized the whole cache for every 128-query window.
                 cached_len = seq_len - q_len
                 block_table_row = attn_metadata.block_table[i : i + 1]
+                # _continuation_prefill dequants the whole cached KV into fp16
+                # (workspace k/v buf + dense k_full/v_full); that transient grows
+                # ~4*head_bytes per cached token. Under a greedy KV pool the free
+                # headroom is small, so for very long continuations this would
+                # OOM. Fall back to the int4-direct tiled decode (memory-bounded,
+                # slower) only when the dequant transient would not fit.
+                dequant_bytes = (
+                    2 * (cached_len + seq_len) * self.num_kv_heads * self.head_size * 2
+                )
                 if q_len <= _CONTINUATION_DECODE_THRESHOLD:
                     # Fast path: treat each query as a decode request
                     # with incremental seq_lens for causal masking.
@@ -777,18 +791,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     out = self._decode_chunk(
                         q_seq, kv_cache, block_table_row, synth_seq_lens, Pi, centroids, PiT
                     )
-                elif self.head_size > _FLASH_ATTN_MAX_HEAD_SIZE:
-                    # Large-head layers (e.g. Gemma-4 globals, head_dim=512) have
-                    # no FlashAttention kernel, and _continuation_prefill's SDPA
-                    # fallback would materialize the full (Hq, q_len, seq_len)
-                    # score matrix -- GiBs at chunk size 2560, and unscalable to
-                    # 200K. A single decode call over all q_len queries instead
-                    # makes the kernel's split-K scratch scale with q_len (also
-                    # OOMs). So tile the decode over q_len in windows of
-                    # _CONTINUATION_DECODE_THRESHOLD: scratch stays bounded
-                    # regardless of context length. The per-window Python loop is
-                    # a one-time prefill cost (decode is the steady-state hot
-                    # path), an accepted trade for memory safety.
+                elif dequant_bytes > 0.8 * torch.cuda.mem_get_info()[0]:
+                    # Memory-bounded fallback: tile the int4-direct decode over
+                    # q_len (no full dequant buffer). Slower, but never OOMs --
+                    # only hit near the memory ceiling at very long context.
                     for s in range(0, q_len, _CONTINUATION_DECODE_THRESHOLD):
                         e = min(s + _CONTINUATION_DECODE_THRESHOLD, q_len)
                         synth_seq_lens = _arange_cache[
@@ -805,8 +811,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         ).to(query.dtype)
                     continue
                 else:
-                    # Large continuation: dequant cached K/V and use
-                    # flash_attn for better throughput.
+                    # Large continuation, transient fits: dequant cached K/V
+                    # ONCE, then attend (flash head<=256 / per-head mem-efficient
+                    # SDPA head>256). ~5x faster than the tiled decode.
                     out = self._continuation_prefill(
                         layer,
                         q_seq,
@@ -946,13 +953,38 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_q=q_len,
                 max_seqlen_k=seq_len,
             )
+        q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
+        k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
+        v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
+        if self.head_size > _FLASH_ATTN_MAX_HEAD_SIZE:
+            # head>256 (Gemma-4 globals; full attention, no sliding window) has
+            # no FlashAttention kernel. Use the mem-efficient SDPA backend, ONE
+            # query head at a time so the single shared KV head is NOT expanded
+            # to Hq (a GQA expand would be Hq x the dequanted cache -> ~6 GiB at
+            # 200K; the per-head loop keeps it at the unexpanded ~0.4 GiB and is
+            # bit-identical to the expanded result). is_causal is TOP-LEFT in
+            # this torch and would mis-align q_len<seq_len, so use the bottom-
+            # right ``causal_lower_right`` bias (query i -> keys [0, cached_len+i]).
+            assert self.sliding_window is None, (
+                "head>256 TQ layer unexpectedly has a sliding window"
+            )
+            g = Hq // Hk
+            bias = causal_lower_right(q_len, seq_len)
+            out = torch.empty(1, Hq, q_len, D, device=device, dtype=q_t.dtype)
+            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                for h in range(Hq):
+                    kv = h // g
+                    out[:, h : h + 1] = F.scaled_dot_product_attention(
+                        q_t[:, h : h + 1],
+                        k_t[:, kv : kv + 1],
+                        v_t[:, kv : kv + 1],
+                        attn_mask=bias,
+                        scale=self.scale,
+                    )
+            return out[0].transpose(0, 1)  # (q_len, Hq, D)
         else:
-            # SDPA fallback: expand KV for GQA, build causal mask
-            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
+            # head<=256 without FlashAttention (rare CPU-fallback path): explicit
+            # bottom-right causal (+ window) mask. Bounded for small head/window.
             q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
             k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
             mask = k_pos <= q_pos  # (q_len, seq_len)
